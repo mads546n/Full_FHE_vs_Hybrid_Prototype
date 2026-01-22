@@ -1,5 +1,6 @@
 // main.cpp — Prototype 3 (one-shot loop): Full FHE vs Hybrid (feature boundary)
-// Adds: output ciphertext size, end-to-end latency, plaintext baseline + CKKS error,
+// Adds: realistic healthcare IoT "patient record" payload, explicit what is encrypted,
+// output ciphertext size, end-to-end latency, plaintext baseline + CKKS error,
 // CSV logging, and parameter/input sweeps.
 
 #include <seal/seal.h>
@@ -56,22 +57,69 @@ static size_t serialized_size(const T &seal_obj) {
     return static_cast<size_t>(ss.tellp());
 }
 
-static std::vector<double> make_raw_window(size_t n, uint32_t seed = 123) {
-    std::mt19937 rng(seed);
-    std::normal_distribution<double> noise(0.0, 1.0);
+// ---------------------------
+// Realistic healthcare IoT data model
+// ---------------------------
+struct PatientRecord {
+    std::string pseudonym;   // plaintext ID tag, e.g. "P042"
+    std::string name;        // realism only (NOT encrypted)
+    int age;                 // can be encrypted
+    int sex;                 // 0/1 (can be encrypted)
+    double weight_kg;        // can be encrypted
+    double height_cm;        // can be encrypted
+    std::vector<double> signal; // physiological window (encrypted in FULL_FHE_RAW)
+};
 
+// A realistic-ish heart-rate time series: baseline depends on age + mild rhythm + drift + noise + event spike.
+static std::vector<double> make_hr_series(size_t n, int age, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> noise(0.0, 0.8);
+
+    double base = 72.0 + (age > 60 ? 5.0 : 0.0); // toy realism: older patients slightly higher baseline
     std::vector<double> x(n);
-    double base = 75.0;          // e.g., HR baseline
-    double trend_per_step = 0.02;
+
     for (size_t i = 0; i < n; i++) {
-        x[i] = base + trend_per_step * static_cast<double>(i) + noise(rng);
+        double t = static_cast<double>(i);
+        double rhythm = 2.0 * std::sin(2.0 * 3.1415926535 * t / 60.0); // periodic variation
+        double drift = 0.01 * t;                                       // slow drift
+        double spike = (i == n / 2) ? 12.0 : 0.0;                      // simulated event
+
+        x[i] = base + rhythm + drift + spike + noise(rng);
     }
     return x;
 }
 
-// Feature extractor for Hybrid:
+static PatientRecord make_patient(size_t n_raw, uint32_t seed = 1234) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> age_dist(20, 85);
+    std::uniform_int_distribution<int> sex_dist(0, 1);
+    std::uniform_real_distribution<double> w_dist(50.0, 110.0);
+    std::uniform_real_distribution<double> h_dist(150.0, 200.0);
+
+    int age = age_dist(rng);
+    int sex = sex_dist(rng);
+    double weight = w_dist(rng);
+    double height = h_dist(rng);
+
+    std::vector<std::string> names = {"Anna", "Peter", "Fatima", "Jonas", "Sara", "Omar", "Maja", "Noah"};
+    std::uniform_int_distribution<int> name_dist(0, static_cast<int>(names.size() - 1));
+
+    PatientRecord p;
+    p.pseudonym = "P" + std::to_string((seed % 900) + 100);
+    p.name = names[name_dist(rng)];
+    p.age = age;
+    p.sex = sex;
+    p.weight_kg = weight;
+    p.height_cm = height;
+    p.signal = make_hr_series(n_raw, age, seed + 77);
+    return p;
+}
+
+// ---------------------------
+// Feature extractor (Hybrid)
 // base: [mean, variance, min, max, slope]
-// extended: adds [median, iqr, zcr-ish, energy] until reaching target_k (simple, deterministic)
+// then adds [median, iqr, zcr-ish, energy] until reaching target_k
+// ---------------------------
 static std::vector<double> extract_features(const std::vector<double> &x, size_t target_k = 5) {
     if (x.empty()) throw std::invalid_argument("empty input");
     const size_t n = x.size();
@@ -95,9 +143,7 @@ static std::vector<double> extract_features(const std::vector<double> &x, size_t
     double sum_y = std::accumulate(x.begin(), x.end(), 0.0);
 
     double sum_ty = 0.0;
-    for (size_t i = 0; i < n; i++) {
-        sum_ty += static_cast<double>(i) * x[i];
-    }
+    for (size_t i = 0; i < n; i++) sum_ty += static_cast<double>(i) * x[i];
 
     double denom = static_cast<double>(n) * sum_t2 - sum_t * sum_t;
     double slope = 0.0;
@@ -111,12 +157,10 @@ static std::vector<double> extract_features(const std::vector<double> &x, size_t
         return feats;
     }
 
-    // Additional robust/simple stats (deterministic)
     std::vector<double> sorted = x;
     std::sort(sorted.begin(), sorted.end());
 
     auto percentile = [&](double p) -> double {
-        if (sorted.empty()) return 0.0;
         double idx = p * (static_cast<double>(sorted.size() - 1));
         size_t i0 = static_cast<size_t>(std::floor(idx));
         size_t i1 = static_cast<size_t>(std::ceil(idx));
@@ -149,14 +193,46 @@ static std::vector<double> extract_features(const std::vector<double> &x, size_t
         feats.push_back(v);
     }
 
-    // If still short, pad with deterministic combinations (keeps reproducible)
-    while (feats.size() < target_k) {
-        feats.push_back(mean + 0.001 * static_cast<double>(feats.size()));
-    }
-
+    while (feats.size() < target_k) feats.push_back(mean + 0.001 * static_cast<double>(feats.size()));
     return feats;
 }
 
+// ---------------------------
+// Payload builders: define what we actually encrypt
+// FULL: demographics + raw signal window
+// HYBRID: demographics + extracted features
+// ---------------------------
+static std::vector<double> build_full_payload(const PatientRecord &p) {
+    std::vector<double> v;
+    v.reserve(4 + p.signal.size());
+
+    v.push_back(static_cast<double>(p.age));
+    v.push_back(static_cast<double>(p.sex));
+    v.push_back(p.weight_kg);
+    v.push_back(p.height_cm);
+
+    v.insert(v.end(), p.signal.begin(), p.signal.end());
+    return v;
+}
+
+static std::vector<double> build_hybrid_payload(const PatientRecord &p, size_t k_feat) {
+    auto feats = extract_features(p.signal, k_feat);
+
+    std::vector<double> v;
+    v.reserve(4 + feats.size());
+
+    v.push_back(static_cast<double>(p.age));
+    v.push_back(static_cast<double>(p.sex));
+    v.push_back(p.weight_kg);
+    v.push_back(p.height_cm);
+
+    v.insert(v.end(), feats.begin(), feats.end());
+    return v;
+}
+
+// ---------------------------
+// Model (toy): linear risk score = dot(x, w) + b
+// ---------------------------
 static std::vector<double> make_weights(size_t dim, uint32_t seed = 999) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> dist(-0.05, 0.05);
@@ -176,7 +252,6 @@ static double plaintext_dot(const std::vector<double> &x, const std::vector<doub
 
 // Encrypted dot product using CKKS packing (one ciphertext).
 static Ciphertext encrypted_dot_product_one_ct(
-        const SEALContext &context,
         CKKSEncoder &encoder,
         Evaluator &evaluator,
         const Ciphertext &ct_x,
@@ -186,7 +261,6 @@ static Ciphertext encrypted_dot_product_one_ct(
 ) {
     if (w.empty()) throw std::invalid_argument("weights empty");
 
-    // Encode weights at ct_x.scale() and at the same parms_id if needed.
     Plaintext pt_w;
     encoder.encode(w, ct_x.scale(), pt_w);
     pt_w.parms_id() = ct_x.parms_id();
@@ -194,7 +268,7 @@ static Ciphertext encrypted_dot_product_one_ct(
     Ciphertext ct = ct_x;
     evaluator.multiply_plain_inplace(ct, pt_w);
 
-    // Sum all slots: rotate-and-add
+    // rotate-and-add reduction across slots
     size_t n = w.size();
     size_t steps = 1;
     while (steps < n) steps <<= 1;
@@ -205,7 +279,6 @@ static Ciphertext encrypted_dot_product_one_ct(
         evaluator.add_inplace(ct, rotated);
     }
 
-    // Add bias (plaintext) matched to ct parms/scale
     Plaintext pt_b;
     encoder.encode(bias, ct.scale(), pt_b);
     pt_b.parms_id() = ct.parms_id();
@@ -236,7 +309,6 @@ struct Setup {
     std::unique_ptr<Decryptor> decryptor;
     std::unique_ptr<Evaluator> evaluator;
 
-    // For logging
     size_t poly_modulus_degree = 0;
     std::vector<int> coeff_modulus_bits;
 };
@@ -246,9 +318,7 @@ static Setup setup_ckks(size_t poly_modulus_degree, const std::vector<int> &coef
     parms.set_poly_modulus_degree(poly_modulus_degree);
     parms.set_coeff_modulus(CoeffModulus::Create(poly_modulus_degree, coeff_modulus_bits));
 
-    SEALContext context(parms, /*expand_mod_chain*/ true, sec_level_type::tc128);
-
-    // Validate parameters (helpful for reporting)
+    SEALContext context(parms, true, sec_level_type::tc128);
     if (!context.parameters_set()) {
         throw std::runtime_error("SEALContext: parameters_set() is false. Try different parms.");
     }
@@ -295,9 +365,6 @@ static Timings run_one_shot(
         const std::vector<double> &input_vec,
         const std::vector<double> &weights,
         double bias,
-        const std::string &mode_label,
-        size_t N_raw,
-        size_t k_feat,
         const Timings &setup_sizes_for_logging,
         bool verbose = false
 ) {
@@ -324,7 +391,6 @@ static Timings run_one_shot(
     // Server: eval dot product
     auto t1 = std::chrono::high_resolution_clock::now();
     Ciphertext ct_score = encrypted_dot_product_one_ct(
-            s.context,
             *s.encoder,
             *s.evaluator,
             ct_x,
@@ -349,11 +415,11 @@ static Timings run_one_shot(
     t.rel_error = (denom > 1e-12) ? (t.abs_error / denom) : 0.0;
 
     if (verbose) {
-        std::cout << "\n[" << mode_label << "] score_fhe=" << std::setprecision(10) << t.fhe_score
+        std::cout << "score_fhe=" << std::setprecision(10) << t.fhe_score
                   << " score_plain=" << t.plaintext_score
                   << " abs_err=" << t.abs_error
                   << " rel_err=" << t.rel_error << "\n";
-        std::cout << "[" << mode_label << "] enc_ms=" << t.encode_encrypt_ms
+        std::cout << "enc_ms=" << t.encode_encrypt_ms
                   << " eval_ms=" << t.server_eval_ms
                   << " dec_ms=" << t.decrypt_decode_ms
                   << " e2e_ms=" << t.end_to_end_ms
@@ -375,7 +441,6 @@ static std::string bits_to_string(const std::vector<int> &bits) {
 
 int main() {
     try {
-        // ---- CKKS parameter presets ----
         struct ParamSet {
             size_t poly_modulus_degree;
             std::vector<int> coeff_modulus_bits;
@@ -384,21 +449,20 @@ int main() {
         };
 
         std::vector<ParamSet> param_sets = {
-                {8192,  {60, 40, 40, 60}, std::pow(2.0, 40), "P1_8192_60-40-40-60_scale2^40"},
-                // Optional heavier set (uncomment if you want a second curve)
+                {8192, {60, 40, 40, 60}, std::pow(2.0, 40), "P1_8192_60-40-40-60_scale2^40"},
                 // {16384, {60, 45, 45, 45, 60}, std::pow(2.0, 45), "P2_16384_60-45-45-45-60_scale2^45"},
         };
 
-        // ---- Experiment sweeps ----
+        // Experiment sweeps
         std::vector<size_t> raw_dims = {128, 256, 512, 1024};
         std::vector<size_t> feat_dims = {5, 8, 16, 32};
-        int runs_per_point = 5; // increase for smoother stats
+        int runs_per_point = 5;
 
-        // CSV output
         std::ofstream csv("results.csv");
         if (!csv) throw std::runtime_error("Failed to open results.csv for writing");
 
-        csv << "mode,param_name,poly_modulus_degree,coeff_modulus_bits,scale,"
+        // Added patient_id and payload_type for clarity
+        csv << "patient_id,mode,payload_type,param_name,poly_modulus_degree,coeff_modulus_bits,scale,"
                "N_raw,k_feat,dim_used,"
                "enc_ms,eval_ms,dec_ms,e2e_ms,"
                "ct_in_bytes,ct_out_bytes,pk_bytes,rlk_bytes,gk_bytes,"
@@ -410,7 +474,6 @@ int main() {
             Timings setup_t;
             Setup s = setup_ckks(ps.poly_modulus_degree, ps.coeff_modulus_bits, ps.scale, setup_t);
 
-            // Print one-time setup stats
             std::cout << "\n=== ParamSet: " << ps.name << " ===\n";
             std::cout << "poly_modulus_degree=" << ps.poly_modulus_degree
                       << " coeff_modulus_bits=[" << bits_to_string(ps.coeff_modulus_bits) << "]"
@@ -420,41 +483,53 @@ int main() {
                       << " rlk_bytes=" << setup_t.relin_keys_bytes
                       << " gk_bytes=" << setup_t.galois_keys_bytes << "\n";
 
-            // Seed changes per run for variety (still reproducible)
             uint32_t base_seed = 1000;
 
             for (size_t N_raw : raw_dims) {
                 for (size_t k_feat : feat_dims) {
                     for (int r = 0; r < runs_per_point; r++) {
-                        uint32_t seed = base_seed + static_cast<uint32_t>(r) + static_cast<uint32_t>(N_raw * 10 + k_feat);
+                        uint32_t seed = base_seed + static_cast<uint32_t>(r)
+                                        + static_cast<uint32_t>(N_raw * 10 + k_feat);
 
-                        // Generate raw window and features
-                        auto raw = make_raw_window(N_raw, seed);
-                        auto feats = extract_features(raw, k_feat);
+                        // Create realistic patient + signal
+                        PatientRecord patient = make_patient(N_raw, seed);
 
-                        // Weights per dimension (keep seeded so repeatable)
-                        auto w_raw = make_weights(N_raw, 900 + seed);
-                        auto w_feat = make_weights(k_feat, 901 + seed);
+                        // Build payloads (explicit what we encrypt)
+                        auto full_payload = build_full_payload(patient);             // demographics + raw signal
+                        auto hybrid_payload = build_hybrid_payload(patient, k_feat); // demographics + features
+
+                        // Print explicit description occasionally (first run per point)
+                        if (r == 0) {
+                            std::cout << "\nPatient " << patient.pseudonym
+                                      << " (name=" << patient.name
+                                      << ", age=" << patient.age
+                                      << ", sex=" << patient.sex
+                                      << ")\n";
+                            std::cout << "  FULL encrypts: [age,sex,weight,height] + raw_signal_window -> dim_used="
+                                      << full_payload.size() << "\n";
+                            std::cout << "  HYBRID encrypts: [age,sex,weight,height] + extracted_features -> dim_used="
+                                      << hybrid_payload.size() << "\n";
+                        }
+
+                        // Weights must match payload sizes
+                        auto w_full = make_weights(full_payload.size(), 900 + seed);
+                        auto w_hyb  = make_weights(hybrid_payload.size(), 901 + seed);
                         double b = make_bias();
 
-                        // FULL FHE: encrypt raw window and score
+                        // FULL FHE
                         {
-                            auto t_full = run_one_shot(
-                                    s, raw, w_raw, b,
-                                    "FULL_FHE_RAW",
-                                    N_raw, k_feat,
-                                    setup_t,
-                                    /*verbose*/ false
-                            );
+                            auto t_full = run_one_shot(s, full_payload, w_full, b, setup_t, false);
 
-                            csv << "FULL_FHE_RAW" << ","
+                            csv << patient.pseudonym << ","
+                                << "FULL_FHE_RAW" << ","
+                                << "\"demo+raw\"" << ","
                                 << ps.name << ","
                                 << ps.poly_modulus_degree << ","
                                 << "\"" << bits_to_string(ps.coeff_modulus_bits) << "\"" << ","
                                 << ps.scale << ","
                                 << N_raw << ","
                                 << k_feat << ","
-                                << N_raw << ","
+                                << full_payload.size() << ","
                                 << t_full.encode_encrypt_ms << ","
                                 << t_full.server_eval_ms << ","
                                 << t_full.decrypt_decode_ms << ","
@@ -471,24 +546,20 @@ int main() {
                                 << "\n";
                         }
 
-                        // HYBRID: extract features (plaintext on client), encrypt features and score
+                        // HYBRID
                         {
-                            auto t_hyb = run_one_shot(
-                                    s, feats, w_feat, b,
-                                    "HYBRID_FEATURES",
-                                    N_raw, k_feat,
-                                    setup_t,
-                                    /*verbose*/ false
-                            );
+                            auto t_hyb = run_one_shot(s, hybrid_payload, w_hyb, b, setup_t, false);
 
-                            csv << "HYBRID_FEATURES" << ","
+                            csv << patient.pseudonym << ","
+                                << "HYBRID_FEATURES" << ","
+                                << "\"demo+feat\"" << ","
                                 << ps.name << ","
                                 << ps.poly_modulus_degree << ","
                                 << "\"" << bits_to_string(ps.coeff_modulus_bits) << "\"" << ","
                                 << ps.scale << ","
                                 << N_raw << ","
                                 << k_feat << ","
-                                << k_feat << ","
+                                << hybrid_payload.size() << ","
                                 << t_hyb.encode_encrypt_ms << ","
                                 << t_hyb.server_eval_ms << ","
                                 << t_hyb.decrypt_decode_ms << ","
@@ -510,7 +581,7 @@ int main() {
         } // param_sets
 
         csv.close();
-        std::cout << "Done. CSV saved as results.csv\n";
+        std::cout << "\nDone. CSV saved as results.csv\n";
         std::cout << "Next: plot e2e_ms vs dim_used for both modes, and ct_in/out_bytes vs dim_used.\n";
         return 0;
 
